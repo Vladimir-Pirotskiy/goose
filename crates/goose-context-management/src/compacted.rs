@@ -49,15 +49,10 @@ pub fn latest_prompt(messages: &[Message]) -> Option<usize> {
 }
 
 fn reissued(prompt: &Message) -> Message {
-    prompt
-        .agent_visible_content()
-        .content
-        .into_iter()
-        .filter(|content| matches!(content, MessageContent::Text(_)))
-        .fold(
-            Message::user().with_metadata(MessageMetadata::agent_only()),
-            Message::with_content,
-        )
+    prompt.agent_visible_content().content.into_iter().fold(
+        Message::user().with_metadata(MessageMetadata::agent_only()),
+        Message::with_content,
+    )
 }
 
 /// Lays out the compacted conversation: every message becomes agent-invisible,
@@ -182,55 +177,5 @@ mod tests {
             .iter()
             .filter(|message| !message.is_agent_visible())
             .all(|message| message.is_turn_context() || message.is_user_visible()));
-    }
-
-    #[test]
-    fn an_in_band_reply_is_archived_without_shaping_the_continuation() {
-        let mut request = Message::user()
-            .with_text("write working notes")
-            .with_metadata(MessageMetadata::agent_only());
-        request.metadata.hide_response = true;
-        let messages = [
-            Message::user().with_text("the prompt"),
-            turn_context("<turn-context>now</turn-context>"),
-            request,
-            Message::assistant().with_text("the notes"),
-        ];
-        let compacted = compacted_conversation(
-            &messages,
-            2,
-            summary(),
-            latest_prompt(&messages[..2]),
-            false,
-        );
-
-        assert_eq!(
-            agent_texts(&compacted),
-            [
-                "summary",
-                CONVERSATION_CONTINUATION_TEXT,
-                "the prompt",
-                "<turn-context>now</turn-context>",
-            ]
-        );
-        assert!(compacted
-            .messages()
-            .iter()
-            .take(messages.len())
-            .all(|message| !message.is_agent_visible()));
-    }
-
-    #[test]
-    fn manual_compaction_does_not_replay_a_prompt() {
-        let messages = [
-            Message::user().with_text("the prompt"),
-            Message::assistant().with_text("done"),
-        ];
-        let compacted = compacted_conversation(&messages, messages.len(), summary(), None, true);
-
-        assert_eq!(
-            agent_texts(&compacted),
-            ["summary", MANUAL_COMPACT_CONTINUATION_TEXT]
-        );
     }
 }

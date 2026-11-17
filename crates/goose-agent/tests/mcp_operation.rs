@@ -10,8 +10,8 @@ use goose_agent::{
     machine::{MachineSession, StateMachine, Step},
     mcp::{
         client::{ConnectContext, McpCallContext, McpClientTrait},
-        ClientContext, Container, ExtensionHost, ExtensionManager, ExtensionOperation,
-        ExtensionSet, ExtensionSource, ExtensionSpec,
+        ClientContext, Container, ExtensionHost, ExtensionLease, ExtensionManager,
+        ExtensionOperation, ExtensionSet, ExtensionSource, ExtensionSpec,
     },
     operation::{ConversationEffect, Emitter},
     tool_call_state::EXECUTABLE_KEY,
@@ -125,16 +125,16 @@ impl MachineSession for Session {
     }
 }
 
-struct Source(Mutex<Vec<Config>>);
+struct Source {
+    manager: Arc<ExtensionManager<Config>>,
+    selection: Mutex<Vec<Config>>,
+}
 
 #[async_trait]
 impl ExtensionSource<Session, Config> for Source {
-    async fn extensions(&self, session: &Session) -> Result<ExtensionSet<Config>> {
-        Ok(ExtensionSet::new(
-            session.id(),
-            None,
-            self.0.lock().unwrap().clone(),
-        )?)
+    async fn advertise(&self, session: &Session) -> Result<ExtensionLease<Config>> {
+        let set = ExtensionSet::new(session.id(), None, self.selection.lock().unwrap().clone())?;
+        Ok(self.manager.resolve(&set).await)
     }
 }
 
@@ -154,8 +154,11 @@ impl Fixture {
             Arc::new(ActionRequiredManager::new()),
             ClientContext::new("test", "1"),
         ));
-        let source = Arc::new(Source(Mutex::new(vec![Config("original")])));
-        let operation = Arc::new(ExtensionOperation::new(manager.clone(), source.clone()));
+        let source = Arc::new(Source {
+            manager: manager.clone(),
+            selection: Mutex::new(vec![Config("original")]),
+        });
+        let operation = Arc::new(ExtensionOperation::new(source.clone()));
         let machine = StateMachine::new(
             vec![
                 Step::Operation(operation),
@@ -215,7 +218,7 @@ impl Fixture {
 async fn execution_uses_current_selection_without_another_tool_collection() -> Result<()> {
     let mut fixture = Fixture::new();
     fixture.advertise().await?;
-    *fixture.source.0.lock().unwrap() = vec![Config("replacement")];
+    *fixture.source.selection.lock().unwrap() = vec![Config("replacement")];
     fixture.approve_call();
     let result = fixture.execute().await?;
     assert_eq!(result.content[0].as_text().unwrap().text, "replacement");
@@ -241,7 +244,7 @@ async fn execution_without_inference_or_after_manager_release_acquires_a_lease()
 async fn removed_tool_returns_an_error_instead_of_using_the_inference_lease() -> Result<()> {
     let mut fixture = Fixture::new();
     fixture.advertise().await?;
-    *fixture.source.0.lock().unwrap() = Vec::new();
+    *fixture.source.selection.lock().unwrap() = Vec::new();
     fixture.approve_call();
     let result = fixture.execute().await?;
     assert_eq!(result.is_error, Some(true));

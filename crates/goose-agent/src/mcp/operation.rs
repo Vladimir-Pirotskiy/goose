@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use goose_provider_types::conversation::message::{Message, ToolRequest};
@@ -7,8 +5,8 @@ use goose_provider_types::conversation::Conversation;
 use rmcp::model::{CallToolRequestParams, Tool};
 
 use super::{
-    get_tool_owner, recover_mangled_tool_name, CallRequest, ExtensionLease, ExtensionManager,
-    ExtensionSet, ExtensionSpec, ToolCallBatch, ToolCallResult,
+    get_tool_owner, recover_mangled_tool_name, CallRequest, ExtensionLease, ExtensionSpec,
+    ToolCallBatch, ToolCallResult,
 };
 use crate::operation::{
     applied, messages_since_kickoff, not_applicable, Emitter, Operation, OperationResult,
@@ -16,10 +14,66 @@ use crate::operation::{
 use crate::tool_call_state::{tool_calls, ToolCallState};
 use crate::tool_visibility::is_tool_visible_to_model;
 
-/// Chooses the extensions a session runs with.
+/// Supplies the extension lease a session runs with, and shapes how its tools
+/// are offered and called.
 #[async_trait]
-pub trait ExtensionSource<S, C: ExtensionSpec>: Send + Sync {
-    async fn extensions(&self, session: &S) -> Result<ExtensionSet<C>>;
+pub trait ExtensionSource<S: Sync, C: ExtensionSpec>: Send + Sync {
+    /// The lease to advertise to the next inference request, typically
+    /// [`ExtensionManager::resolve`](super::ExtensionManager::resolve) of the
+    /// session's selection.
+    async fn advertise(&self, session: &S) -> Result<ExtensionLease<C>>;
+
+    /// The lease the pending calls were advertised from. `None` leaves the
+    /// calls to later operations, for example when that lease is gone and an
+    /// approval should not run against a newer selection.
+    async fn advertised(
+        &self,
+        session: &S,
+        _conversation: &Conversation,
+    ) -> Result<Option<ExtensionLease<C>>> {
+        self.advertise(session).await.map(Some)
+    }
+
+    /// The lease tools offered to the model and accepted from it. Tools left
+    /// out here are neither advertised nor run.
+    async fn tools(&self, _session: &S, lease: &ExtensionLease<C>) -> Result<Vec<Tool>> {
+        Ok(lease.tools().await)
+    }
+
+    /// Whether a pending call may run. `messages` are the turn's messages.
+    fn accepts(&self, _messages: &[Message], _request: &ToolRequest) -> bool {
+        true
+    }
+
+    /// Wraps a started call, for example to trace it or post-process its result.
+    fn decorate(
+        &self,
+        _session: &S,
+        _request: &ToolRequest,
+        result: ToolCallResult,
+    ) -> ToolCallResult {
+        result
+    }
+
+    /// System prompt parts describing the lease's extensions.
+    async fn prompt_parts(
+        &self,
+        _session: &S,
+        lease: &ExtensionLease<C>,
+    ) -> Result<Vec<(String, String)>> {
+        let mut extensions = lease.instructions().await;
+        extensions.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(extensions
+            .into_iter()
+            .filter(|extension| !extension.instructions.is_empty())
+            .map(|extension| {
+                (
+                    format!("extension:{}", extension.name),
+                    format!("## {}\n\n{}", extension.name, extension.instructions),
+                )
+            })
+            .collect())
+    }
 }
 
 /// Advertises the tools of a session's MCP extensions and runs the calls the
@@ -27,31 +81,23 @@ pub trait ExtensionSource<S, C: ExtensionSpec>: Send + Sync {
 ///
 /// Place it after [`ToolApprovalOperation`](crate::tool_approval::ToolApprovalOperation):
 /// it only runs calls that approval marked executable. Calls to tools it does
-/// not own are left for later operations. Each collection or execution acquires
-/// a lease from the current session; inference leases are not held across approval.
-pub struct ExtensionOperation<S, C: ExtensionSpec> {
-    manager: Arc<ExtensionManager<C>>,
-    source: Arc<dyn ExtensionSource<S, C>>,
+/// not own are left for later operations.
+pub struct ExtensionOperation<S: Sync, C: ExtensionSpec> {
+    source: std::sync::Arc<dyn ExtensionSource<S, C>>,
     batch: ToolCallBatch,
 }
 
-impl<S, C: ExtensionSpec> ExtensionOperation<S, C> {
-    pub fn new(manager: Arc<ExtensionManager<C>>, source: Arc<dyn ExtensionSource<S, C>>) -> Self {
+impl<S: Sync, C: ExtensionSpec> ExtensionOperation<S, C> {
+    pub fn new(source: std::sync::Arc<dyn ExtensionSource<S, C>>) -> Self {
         Self {
-            manager,
             source,
             batch: ToolCallBatch::new(),
         }
     }
-
-    async fn lease(&self, session: &S) -> Result<ExtensionLease<C>> {
-        let set = self.source.extensions(session).await?;
-        Ok(self.manager.resolve(&set).await)
-    }
 }
 
-fn executable_requests(conversation: &Conversation) -> Result<Vec<ToolRequest>> {
-    Ok(tool_calls(messages_since_kickoff(conversation)?)
+fn executable_requests(messages: &[Message]) -> Vec<ToolRequest> {
+    tool_calls(messages)
         .into_iter()
         .filter(|(request, state)| {
             *state == ToolCallState::Executable
@@ -59,7 +105,7 @@ fn executable_requests(conversation: &Conversation) -> Result<Vec<ToolRequest>> 
                 && !request.was_executed_externally()
         })
         .map(|(request, _)| request.clone())
-        .collect())
+        .collect()
 }
 
 fn owned_call(request: &ToolRequest, tools: &[Tool]) -> Option<CallToolRequestParams> {
@@ -77,6 +123,14 @@ fn owned_call(request: &ToolRequest, tools: &[Tool]) -> Option<CallToolRequestPa
     )?;
     call.name = recovered.into();
     Some(call)
+}
+
+fn emit_response(emit: &Emitter, response: Message) -> Message {
+    let response = response.with_generated_id_if_missing();
+    emit.emit(crate::events::AgentEvent::Message(
+        response.user_visible_content(),
+    ));
+    response
 }
 
 #[async_trait]
@@ -99,19 +153,24 @@ where
         let (actions, response) = self.batch.take();
         actions
             .into_iter()
-            .chain(response.map(|response| emit.message(response)))
+            .chain(response.map(|response| emit_response(emit, response)))
             .map(E::from)
             .collect()
     }
 
     async fn inference_tools(&self, session: &S) -> Result<Vec<Tool>> {
-        let lease = self.lease(session).await?;
-        Ok(lease
-            .tools()
-            .await
-            .into_iter()
-            .filter(is_tool_visible_to_model)
-            .collect())
+        let lease = self.source.advertise(session).await?;
+        let tools = self.source.tools(session, &lease).await?;
+        Ok(tools.into_iter().filter(is_tool_visible_to_model).collect())
+    }
+
+    async fn prompt_parts(
+        &self,
+        session: &S,
+        _conversation: &Conversation,
+    ) -> Result<Vec<(String, String)>> {
+        let lease = self.source.advertise(session).await?;
+        self.source.prompt_parts(session, &lease).await
     }
 
     async fn run(
@@ -120,12 +179,18 @@ where
         conversation: &Conversation,
         emit: &Emitter,
     ) -> Result<OperationResult<E>> {
-        let requests = executable_requests(conversation)?;
+        let messages = messages_since_kickoff(conversation)?;
+        let requests: Vec<_> = executable_requests(messages)
+            .into_iter()
+            .filter(|request| self.source.accepts(messages, request))
+            .collect();
         if requests.is_empty() {
             return not_applicable();
         }
-        let lease = self.lease(session).await?;
-        let tools = lease.tools().await;
+        let Some(lease) = self.source.advertised(session, conversation).await? else {
+            return not_applicable();
+        };
+        let tools = self.source.tools(session, &lease).await?;
         let owned: Vec<_> = requests
             .into_iter()
             .filter_map(|request| owned_call(&request, &tools).map(|call| (request, call)))
@@ -144,13 +209,14 @@ where
                 )
                 .await
                 .unwrap_or_else(|error| ToolCallResult::from(Err(error)));
+            let result = self.source.decorate(session, &request, result);
             calls.push((request, result));
         }
         let (actions, response) = self.batch.run(calls, emit).await?;
         applied(
             actions
                 .into_iter()
-                .chain([emit.message(response)])
+                .chain([emit_response(emit, response)])
                 .map(E::from),
         )
     }

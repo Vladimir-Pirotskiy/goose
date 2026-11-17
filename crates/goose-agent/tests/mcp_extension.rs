@@ -13,8 +13,8 @@ use goose_agent::{
     inference::{InferenceEffect, InferenceRunner},
     machine::{EffectHandler, MachineSession, SessionLoader, StateMachine, Step},
     mcp::{
-        ClientContext, ExtensionHost, ExtensionManager, ExtensionOperation, ExtensionSet,
-        ExtensionSource,
+        ClientContext, ExtensionHost, ExtensionLease, ExtensionManager, ExtensionOperation,
+        ExtensionSet, ExtensionSource,
     },
     operation::{ConversationEffect, Emitter, MachineEffect},
     tool_approval::{ApprovalDecision, ToolApproval, ToolApprovalOperation},
@@ -91,17 +91,15 @@ struct Host;
 impl ExtensionHost<ExtensionConfig> for Host {}
 
 struct Extensions {
+    manager: Arc<ExtensionManager<ExtensionConfig>>,
     server: ExtensionConfig,
 }
 
 #[async_trait]
 impl ExtensionSource<Session, ExtensionConfig> for Extensions {
-    async fn extensions(&self, session: &Session) -> Result<ExtensionSet<ExtensionConfig>> {
-        Ok(ExtensionSet::new(
-            session.id.clone(),
-            None,
-            vec![self.server.clone()],
-        )?)
+    async fn advertise(&self, session: &Session) -> Result<ExtensionLease<ExtensionConfig>> {
+        let set = ExtensionSet::new(session.id.clone(), None, vec![self.server.clone()])?;
+        Ok(self.manager.resolve(&set).await)
     }
 }
 
@@ -287,10 +285,10 @@ async fn runs_a_turn_against_a_stdio_server() -> Result<()> {
     let machine = StateMachine::<Session, Effect>::new(
         vec![
             Step::Operation(Arc::new(ToolApprovalOperation::new(Arc::new(AllowAll)))),
-            Step::Operation(Arc::new(ExtensionOperation::new(
-                Arc::clone(&manager),
-                Arc::new(Extensions { server }),
-            ))),
+            Step::Operation(Arc::new(ExtensionOperation::new(Arc::new(Extensions {
+                manager: Arc::clone(&manager),
+                server,
+            })))),
             Step::Operation(Arc::new(UnhandledToolCallsOperation::new())),
             Step::Inference(Arc::new(InferenceRunner::new(
                 provider.clone(),

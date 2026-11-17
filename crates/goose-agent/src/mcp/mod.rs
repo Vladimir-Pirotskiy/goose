@@ -24,21 +24,25 @@ use goose_provider_types::conversation::message::Message;
 use rmcp::model::{CallToolResult, MetaObject, ServerConfig, Tool};
 use serde_json::Value;
 
+mod batch;
 mod call;
 pub mod client;
 pub mod container;
 mod host;
 mod lease;
 pub mod malware_check;
+mod operation;
 mod stdio;
 mod streamable_http;
 pub mod tool_schema_normalize;
 
+pub use batch::{ResultNotification, ToolCallBatch};
 pub use call::{ToolCallNotificationEmitter, ToolCallResult, ToolResult};
 pub use host::{
     ExtensionAuth, ExtensionHost, ExtensionSpec, StaticOAuthClientConfig, TraceContextInjector,
 };
 pub use lease::{CallRequest, ExtensionLease, ExtensionSet, LeaseId};
+pub use operation::{ExtensionOperation, ExtensionSource};
 pub use stdio::{docker_exec, spawn as spawn_stdio};
 
 type McpClientBox = Arc<dyn McpClientTrait>;
@@ -332,6 +336,14 @@ pub struct ClientContext {
 }
 
 impl ClientContext {
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            capabilities: GooseMcpClientCapabilities::default(),
+        }
+    }
+
     fn hydrates_mcp_apps(&self) -> bool {
         match &self.capabilities.host_info {
             Some(host_info) if host_info.explicit_extensions => host_info.mcpui_enabled(),

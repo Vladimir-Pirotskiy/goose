@@ -1,5 +1,10 @@
 //! The MCP extension runtime: scoped slots, leases, tool catalogs, dispatch and
 //! transports. Everything application-specific comes from an [`ExtensionHost`].
+//!
+//! Acquire a lease from the current session's [`ExtensionSet`] at point of use.
+//! Leases keep resources alive for one logical operation, not across inference
+//! and approval. The manager owns process reuse and reconnection; session changes
+//! made while approval is pending therefore apply when execution acquires its lease.
 
 use futures::Stream;
 use indexmap::IndexMap;

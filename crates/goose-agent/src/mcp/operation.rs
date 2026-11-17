@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -28,13 +27,11 @@ pub trait ExtensionSource<S, C: ExtensionSpec>: Send + Sync {
 ///
 /// Place it after [`ToolApprovalOperation`](crate::tool_approval::ToolApprovalOperation):
 /// it only runs calls that approval marked executable. Calls to tools it does
-/// not own are left for later operations.
+/// not own are left for later operations. Each collection or execution acquires
+/// a lease from the current session; inference leases are not held across approval.
 pub struct ExtensionOperation<S, C: ExtensionSpec> {
     manager: Arc<ExtensionManager<C>>,
     source: Arc<dyn ExtensionSource<S, C>>,
-    /// The lease each scope last advertised to the model, so its calls reach
-    /// the same connections even if the selection changed since.
-    advertised: Mutex<HashMap<String, ExtensionLease<C>>>,
     batch: ToolCallBatch,
 }
 
@@ -43,18 +40,13 @@ impl<S, C: ExtensionSpec> ExtensionOperation<S, C> {
         Self {
             manager,
             source,
-            advertised: Mutex::default(),
             batch: ToolCallBatch::new(),
         }
     }
 
     async fn lease(&self, session: &S) -> Result<ExtensionLease<C>> {
         let set = self.source.extensions(session).await?;
-        let advertised = self.advertised.lock().unwrap().get(set.scope_id()).cloned();
-        match advertised {
-            Some(lease) => Ok(lease),
-            None => Ok(self.manager.resolve(&set).await),
-        }
+        Ok(self.manager.resolve(&set).await)
     }
 }
 
@@ -113,14 +105,13 @@ where
     }
 
     async fn inference_tools(&self, session: &S) -> Result<Vec<Tool>> {
-        let set = self.source.extensions(session).await?;
-        let lease = self.manager.resolve(&set).await;
-        let tools = lease.tools().await;
-        self.advertised
-            .lock()
-            .unwrap()
-            .insert(set.scope_id().to_string(), lease);
-        Ok(tools.into_iter().filter(is_tool_visible_to_model).collect())
+        let lease = self.lease(session).await?;
+        Ok(lease
+            .tools()
+            .await
+            .into_iter()
+            .filter(is_tool_visible_to_model)
+            .collect())
     }
 
     async fn run(
